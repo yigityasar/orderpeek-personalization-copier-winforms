@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Net.Http.Headers;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -52,7 +53,6 @@ namespace Çiçeksepeti_Order_Peek
             ApplyAlwaysOnTopBottomRight();
 
             // Uygulama açılır açılmaz sipariş çekme yok.
-            // Sadece API key boşsa ayar ekranını aç.
             Shown += (_, __) =>
             {
                 if (string.IsNullOrWhiteSpace(_settings.ApiKey))
@@ -132,15 +132,19 @@ namespace Çiçeksepeti_Order_Peek
             lv.Columns.Add("Alan", 140);
             lv.Columns.Add("Müşteri", 140);
 
+            // Tek tık: değeri kopyala (isim alanlarında formatlı)
             lv.ItemSelectionChanged += (_, __) =>
             {
                 if (lv.SelectedItems.Count == 0) return;
-                var raw = lv.SelectedItems[0].Tag as string;
-                if (string.IsNullOrWhiteSpace(raw)) return;
 
-                Clipboard.SetText(raw);
+                if (lv.SelectedItems[0].Tag is not RowTag tag) return;
+                if (string.IsNullOrWhiteSpace(tag.Raw)) return;
+
+                var toCopy = FormatForCopy(tag.Field, tag.Raw);
+                Clipboard.SetText(toCopy);
+
                 SetStatus("Değer kopyalandı ✅");
-                LogOk("Seçili değer panoya kopyalandı.");
+                LogOk($"Kopya: {Preview(toCopy)}");
             };
 
             // Log
@@ -231,7 +235,6 @@ namespace Çiçeksepeti_Order_Peek
         private async Task LookupAndRenderAsync()
         {
             lv.Items.Clear();
-            lv.Groups.Clear();
 
             if (!int.TryParse(txtOrderItemNo.Text.Trim(), out var orderItemId))
             {
@@ -309,7 +312,6 @@ namespace Çiçeksepeti_Order_Peek
 
             try
             {
-                // AYARLARDAN OKU
                 var pastDays = Math.Max(0, _settings.PrefetchPastDays);
                 var futureDays = Math.Max(0, _settings.PrefetchFutureDays);
 
@@ -383,13 +385,12 @@ namespace Çiçeksepeti_Order_Peek
             try
             {
                 lv.Items.Clear();
-                lv.Groups.Clear();
 
                 if (item.Personalizations.Count == 0)
                 {
                     var row = new ListViewItem("Kişiselleştirme");
                     row.SubItems.Add("(Yok)");
-                    row.Tag = "";
+                    row.Tag = new RowTag("Kişiselleştirme", "");
                     lv.Items.Add(row);
                     return;
                 }
@@ -400,8 +401,8 @@ namespace Çiçeksepeti_Order_Peek
                     var raw = p.RawText ?? "";
 
                     var row = new ListViewItem(field);
-                    row.SubItems.Add(raw);
-                    row.Tag = raw;
+                    row.SubItems.Add(raw);                 // EKRANDA RAW
+                    row.Tag = new RowTag(field, raw);      // KOPYADA smart davran
                     lv.Items.Add(row);
                 }
             }
@@ -413,13 +414,52 @@ namespace Çiçeksepeti_Order_Peek
 
         private void CopyOnlyPersonalizationValues(CachedOrderItem item)
         {
-            var values = item.Personalizations
-                .Select(x => (x.RawText ?? "").Trim())
-                .Where(x => !string.IsNullOrWhiteSpace(x))
-                .ToList();
+            // SADECE değerler kopyalanır.
+            // "isim/ad soyad" gibi alanlar formatlanır ama "yilmaz -> Yılmaz" asla olmaz.
+            var lines = new List<string>();
 
-            Clipboard.SetText(values.Count == 0 ? "" : string.Join(Environment.NewLine, values));
-            LogInfo(values.Count == 0 ? "Kopya: boş" : $"Kopya: {values.Count} satır");
+            foreach (var p in item.Personalizations)
+            {
+                var field = p.Field ?? "";
+                var raw = (p.RawText ?? "").Trim();
+                if (string.IsNullOrWhiteSpace(raw)) continue;
+
+                lines.Add(FormatForCopy(field, raw));
+            }
+
+            Clipboard.SetText(lines.Count == 0 ? "" : string.Join(Environment.NewLine, lines));
+            LogInfo(lines.Count == 0 ? "Kopya: boş" : $"Kopya: {lines.Count} satır");
+        }
+
+        private static string FormatForCopy(string field, string raw)
+        {
+            if (!LooksLikeNameField(field)) return raw;
+
+            // Kural: harf “düzeltme” yok, sadece büyük-küçük.
+            // yilmaz -> Yilmaz (Yılmaz değil)
+            return NameFormatter.FormatCustomerNameInvariant(raw);
+        }
+
+        private static bool LooksLikeNameField(string field)
+        {
+            if (string.IsNullOrWhiteSpace(field)) return false;
+            var f = field.Trim().ToLowerInvariant();
+
+            // Buraya istersen keyword ekleriz
+            return f.Contains("isim")
+                || f.Contains("ad soyad")
+                || f.Contains("adı soyadı")
+                || f.Contains("ad-soyad")
+                || f.Contains("isim soyisim")
+                || f.Contains("name")
+                || f.Contains("full name")
+                || f.Contains("fullname");
+        }
+
+        private static string Preview(string s)
+        {
+            s = s.Replace("\r", " ").Replace("\n", " ");
+            return s.Length <= 50 ? s : s.Substring(0, 50) + "…";
         }
 
         // ============== API LOW-LEVEL (THROTTLE + RETRY) ==============
@@ -550,5 +590,89 @@ namespace Çiçeksepeti_Order_Peek
 
         private sealed record CachedOrderItem(int OrderItemId, string ProductName, List<CachedPersonalization> Personalizations);
         private sealed record CachedPersonalization(string Field, string RawText);
+        private sealed record RowTag(string Field, string Raw);
+
+        // ============== NAME FORMATTER (NO TR CORRECTION, ONLY CASE) ==============
+
+        private static class NameFormatter
+        {
+            public static string FormatCustomerNameInvariant(string input)
+            {
+                if (string.IsNullOrWhiteSpace(input)) return input ?? "";
+
+                var raw = input.Trim();
+
+                // Birden fazla boşluğu tek boşluğa indir
+                var parts = Regex.Split(raw, @"\s+")
+                                 .Where(p => !string.IsNullOrWhiteSpace(p))
+                                 .ToArray();
+
+                if (parts.Length == 0) return raw;
+                if (parts.Length == 1) return TitleWord(parts[0]);
+
+                // Soyad (son kelime)
+                var surnameRaw = parts[^1];
+                var nameParts = parts.Take(parts.Length - 1).Select(TitleWord);
+
+                bool surnameWasAllCaps = IsAllLettersUpperInvariant(surnameRaw);
+
+                var surname = surnameWasAllCaps
+                    ? surnameRaw.ToUpperInvariant()
+                    : TitleWord(surnameRaw);
+
+                return string.Join(" ", nameParts.Append(surname));
+            }
+
+            // Sadece "tamamı büyük" kontrolü
+            private static bool IsAllLettersUpperInvariant(string s)
+            {
+                bool hasLetter = false;
+                foreach (var ch in s)
+                {
+                    if (!char.IsLetter(ch)) continue;
+                    hasLetter = true;
+                    if (char.ToUpperInvariant(ch) != ch) return false;
+                }
+                return hasLetter;
+            }
+
+            // Tire ve apostrof gibi ayırıcıları koruyarak Title Case
+            private static string TitleWord(string w)
+            {
+                if (string.IsNullOrWhiteSpace(w)) return w;
+
+                string TitleToken(string token)
+                {
+                    if (token.Length == 0) return token;
+
+                    // DİKKAT: Invariant => türkçe harf “düzeltme” yok.
+                    // Ek olarak: 'İ' -> 'i̇' gibi combining dot saçmalığını engelliyoruz.
+                    var lower = ToLowerInvariantNoCombiningDot(token);
+                    var first = char.ToUpperInvariant(lower[0]);
+                    return lower.Length == 1 ? first.ToString() : first + lower.Substring(1);
+                }
+
+                // - ve ' ayırıcılarını koru
+                var pieces = Regex.Split(w, @"([\-'])");
+                for (int i = 0; i < pieces.Length; i++)
+                {
+                    if (pieces[i] == "-" || pieces[i] == "'") continue;
+                    pieces[i] = TitleToken(pieces[i]);
+                }
+                return string.Concat(pieces);
+            }
+
+            // "İ" -> "i̇" üretmesin diye basit fix:
+            private static string ToLowerInvariantNoCombiningDot(string s)
+            {
+                var sb = new StringBuilder(s.Length);
+                foreach (var ch in s)
+                {
+                    if (ch == 'İ') sb.Append('i'); // düz "i" yap (harf düzeltme değil, case fix)
+                    else sb.Append(char.ToLowerInvariant(ch));
+                }
+                return sb.ToString();
+            }
+        }
     }
 }
