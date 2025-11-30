@@ -1,6 +1,6 @@
 # OrderPeek (Çiçeksepeti)
 
-Çiçeksepeti tedarikçi siparişlerinde, **alt sipariş no (orderItemNo)** ile ürüne ait **kişiselleştirme metinlerini** hızlıca görüp **tek tıkla kopyalamak** için geliştirilmiş küçük bir WinForms yardımcı araçtır.
+Çiçeksepeti satıcılarının siparişlerinde, **alt sipariş no (orderItemNo)** ile ürüne ait **kişiselleştirme metinlerini** hızlıca görüp **tek tıkla kopyalamak** için geliştirilmiş küçük bir WinForms yardımcı araçtır.
 
 > Bu proje **resmi değildir**. Çiçeksepeti ile bir ortaklık/bağlılık/onarım ilişkisi yoktur.  
 > Kişisel kullanım ve operasyonel hız için geliştirilmiştir, ürün olarak satılmaz.
