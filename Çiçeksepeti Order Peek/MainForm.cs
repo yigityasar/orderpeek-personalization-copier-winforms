@@ -1,9 +1,12 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
+using System.Globalization;
+using System.IO;
 using System.Linq;
 using System.Net.Http;
 using System.Net.Http.Headers;
+using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
 using System.Text.RegularExpressions;
@@ -28,6 +31,14 @@ namespace Çiçeksepeti_Order_Peek
         private readonly Label lblStatus = new();
         private readonly RichTextBox txtLog = new();
 
+        // Thumbnails
+        private readonly ImageList _thumbs = new()
+        {
+            ImageSize = new Size(48, 48),
+            ColorDepth = ColorDepth.Depth32Bit
+        };
+        private const string PlaceholderKey = "__placeholder__";
+
         // Cache
         private readonly Dictionary<int, CachedOrderItem> _cacheByOrderItemId = new();
         private DateTime _lastPrefetchUtc = DateTime.MinValue;
@@ -45,6 +56,15 @@ namespace Çiçeksepeti_Order_Peek
             PropertyNameCaseInsensitive = true
         };
 
+        // Image download/cache
+        private readonly Dictionary<string, string> _localFileByUrl = new(StringComparer.OrdinalIgnoreCase);
+        private readonly HashSet<string> _thumbLoading = new(StringComparer.OrdinalIgnoreCase);
+        private readonly SemaphoreSlim _imgDlLock = new(3, 3); // aynı anda max 3 download
+
+        private static string CacheDir =>
+            Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+                "OrderPeek", "image-cache");
+
         public MainForm()
         {
             _settings = SettingsStore.Load();
@@ -52,7 +72,10 @@ namespace Çiçeksepeti_Order_Peek
             BuildUi();
             ApplyAlwaysOnTopBottomRight();
 
+            Directory.CreateDirectory(CacheDir);
+
             // Uygulama açılır açılmaz sipariş çekme yok.
+            // Sadece API key boşsa ayar ekranını aç.
             Shown += (_, __) =>
             {
                 if (string.IsNullOrWhiteSpace(_settings.ApiKey))
@@ -73,8 +96,8 @@ namespace Çiçeksepeti_Order_Peek
             Text = "Çiçeksepeti Order Peek";
             FormBorderStyle = FormBorderStyle.FixedToolWindow;
             TopMost = true;
-            Width = 300;
-            Height = 400;
+            Width = 340;
+            Height = 430;
 
             // ÜST BAR
             var topPanel = new Panel
@@ -126,32 +149,91 @@ namespace Çiçeksepeti_Order_Peek
             lv.View = View.Details;
             lv.FullRowSelect = true;
             lv.GridLines = true;
-            lv.MultiSelect = false;
-            lv.Font = new Font("Segoe UI", 8.5f);
-            lv.Columns.Clear();
-            lv.Columns.Add("Alan", 140);
-            lv.Columns.Add("Müşteri", 140);
 
-            // Tek tık: değeri kopyala (isim alanlarında formatlı)
+            // FOTO için çoklu seçim şart
+            lv.MultiSelect = true;
+
+            lv.Font = new Font("Segoe UI", 8.5f);
+            lv.SmallImageList = _thumbs;
+
+            if (!_thumbs.Images.ContainsKey(PlaceholderKey))
+                _thumbs.Images.Add(PlaceholderKey, MakePlaceholderThumb());
+
+            lv.Columns.Clear();
+            lv.Columns.Add("Alan", 150);
+            lv.Columns.Add("Müşteri", 160);
+
+            // Tek seçimde kopyala (çoklu seçimde kopyalama yapma)
             lv.ItemSelectionChanged += (_, __) =>
             {
-                if (lv.SelectedItems.Count == 0) return;
-
+                if (lv.SelectedItems.Count != 1) return;
                 if (lv.SelectedItems[0].Tag is not RowTag tag) return;
                 if (string.IsNullOrWhiteSpace(tag.Raw)) return;
 
                 var toCopy = FormatForCopy(tag.Field, tag.Raw);
                 Clipboard.SetText(toCopy);
-
                 SetStatus("Değer kopyalandı ✅");
-                LogOk($"Kopya: {Preview(toCopy)}");
+                LogOk("Seçili değer panoya kopyalandı.");
+            };
+
+            // Foto sürükle-bırak
+            lv.ItemDrag += (_, e) =>
+            {
+                try
+                {
+                    var urls = lv.SelectedItems
+                        .Cast<ListViewItem>()
+                        .Select(i => i.Tag as RowTag)
+                        .Where(t => t != null && t.IsImageUrl)
+                        .Select(t => t!.Raw.Trim())
+                        .Distinct(StringComparer.OrdinalIgnoreCase)
+                        .ToList();
+
+                    if (urls.Count == 0)
+                    {
+                        // Foto seçili değilse drag yapma (metin sürükleme istemedin)
+                        return;
+                    }
+
+                    SetStatus($"Foto hazırlanıyor… ({urls.Count})");
+                    LogInfo($"Drag başlıyor (foto): {urls.Count} adet");
+
+                    var files = new List<string>();
+                    foreach (var url in urls)
+                    {
+                        var local = EnsureLocalImageFile(url);
+                        if (!string.IsNullOrWhiteSpace(local) && File.Exists(local))
+                            files.Add(local);
+                    }
+
+                    if (files.Count == 0)
+                    {
+                        SetStatus("Foto indirilemedi.");
+                        return;
+                    }
+
+                    // Photoshop/Explorer için FileDrop
+                    var data = new DataObject();
+                    data.SetData(DataFormats.FileDrop, files.ToArray());
+
+                    // Bonus: bazı uygulamalar URL text sever
+                    data.SetData(DataFormats.UnicodeText, string.Join(Environment.NewLine, urls));
+
+                    SetStatus("Sürükleyebilirsin ✅");
+                    DoDragDrop(data, DragDropEffects.Copy);
+                }
+                catch (Exception ex)
+                {
+                    SetStatus("Drag hata ❌");
+                    LogErr(ex.Message);
+                }
             };
 
             // Log
             txtLog.ReadOnly = true;
             txtLog.ScrollBars = RichTextBoxScrollBars.Vertical;
             txtLog.Dock = DockStyle.Bottom;
-            txtLog.Height = 110;
+            txtLog.Height = 115;
             txtLog.Font = new Font("Consolas", 7.75f);
             txtLog.BackColor = SystemColors.Window;
             txtLog.BorderStyle = BorderStyle.FixedSingle;
@@ -312,6 +394,7 @@ namespace Çiçeksepeti_Order_Peek
 
             try
             {
+                // AYARLARDAN OKU
                 var pastDays = Math.Max(0, _settings.PrefetchPastDays);
                 var futureDays = Math.Max(0, _settings.PrefetchFutureDays);
 
@@ -390,7 +473,8 @@ namespace Çiçeksepeti_Order_Peek
                 {
                     var row = new ListViewItem("Kişiselleştirme");
                     row.SubItems.Add("(Yok)");
-                    row.Tag = new RowTag("Kişiselleştirme", "");
+                    row.Tag = new RowTag("Kişiselleştirme", "", false, null);
+                    row.ImageKey = PlaceholderKey;
                     lv.Items.Add(row);
                     return;
                 }
@@ -400,9 +484,24 @@ namespace Çiçeksepeti_Order_Peek
                     var field = string.IsNullOrWhiteSpace(p.Field) ? "(alan)" : p.Field.Trim();
                     var raw = p.RawText ?? "";
 
+                    bool isImg = LooksLikeImageUrl(field, raw);
+
                     var row = new ListViewItem(field);
-                    row.SubItems.Add(raw);                 // EKRANDA RAW
-                    row.Tag = new RowTag(field, raw);      // KOPYADA smart davran
+                    row.SubItems.Add(raw); // ekranda RAW
+                    row.Tag = new RowTag(field, raw, isImg, null);
+
+                    if (isImg)
+                    {
+                        row.ImageKey = PlaceholderKey;
+
+                        // thumbnail yükle (asenkron)
+                        var url = raw.Trim();
+                        var key = ThumbKey(url);
+                        row.Name = key; // item identity gibi kullanacağız
+
+                        _ = LoadThumbAsync(url, key, row);
+                    }
+
                     lv.Items.Add(row);
                 }
             }
@@ -415,27 +514,22 @@ namespace Çiçeksepeti_Order_Peek
         private void CopyOnlyPersonalizationValues(CachedOrderItem item)
         {
             // SADECE değerler kopyalanır.
-            // "isim/ad soyad" gibi alanlar formatlanır ama "yilmaz -> Yılmaz" asla olmaz.
-            var lines = new List<string>();
+            // isim/ad soyad alanları "harf düzeltmeden" sadece büyük-küçük ile formatlanır.
+            var values = item.Personalizations
+                .Select(x => (x.Field ?? "", (x.RawText ?? "").Trim()))
+                .Where(t => !string.IsNullOrWhiteSpace(t.Item2))
+                .Select(t => FormatForCopy(t.Item1, t.Item2))
+                .ToList();
 
-            foreach (var p in item.Personalizations)
-            {
-                var field = p.Field ?? "";
-                var raw = (p.RawText ?? "").Trim();
-                if (string.IsNullOrWhiteSpace(raw)) continue;
-
-                lines.Add(FormatForCopy(field, raw));
-            }
-
-            Clipboard.SetText(lines.Count == 0 ? "" : string.Join(Environment.NewLine, lines));
-            LogInfo(lines.Count == 0 ? "Kopya: boş" : $"Kopya: {lines.Count} satır");
+            Clipboard.SetText(values.Count == 0 ? "" : string.Join(Environment.NewLine, values));
+            LogInfo(values.Count == 0 ? "Kopya: boş" : $"Kopya: {values.Count} satır");
         }
 
         private static string FormatForCopy(string field, string raw)
         {
             if (!LooksLikeNameField(field)) return raw;
 
-            // Kural: harf “düzeltme” yok, sadece büyük-küçük.
+            // KURAL: harf “düzeltme” yok, sadece büyük-küçük.
             // yilmaz -> Yilmaz (Yılmaz değil)
             return NameFormatter.FormatCustomerNameInvariant(raw);
         }
@@ -445,7 +539,6 @@ namespace Çiçeksepeti_Order_Peek
             if (string.IsNullOrWhiteSpace(field)) return false;
             var f = field.Trim().ToLowerInvariant();
 
-            // Buraya istersen keyword ekleriz
             return f.Contains("isim")
                 || f.Contains("ad soyad")
                 || f.Contains("adı soyadı")
@@ -456,10 +549,209 @@ namespace Çiçeksepeti_Order_Peek
                 || f.Contains("fullname");
         }
 
-        private static string Preview(string s)
+        private static bool LooksLikeImageUrl(string field, string raw)
         {
-            s = s.Replace("\r", " ").Replace("\n", " ");
-            return s.Length <= 50 ? s : s.Substring(0, 50) + "…";
+            if (string.IsNullOrWhiteSpace(raw)) return false;
+
+            if (!Uri.TryCreate(raw.Trim(), UriKind.Absolute, out var uri)) return false;
+            if (uri.Scheme != Uri.UriSchemeHttp && uri.Scheme != Uri.UriSchemeHttps) return false;
+
+            var f = (field ?? "").ToLowerInvariant();
+            if (f.Contains("foto") || f.Contains("resim") || f.Contains("photo") || f.Contains("image"))
+                return true;
+
+            // uzantı/koku
+            var path = uri.AbsolutePath.ToLowerInvariant();
+            if (path.EndsWith(".jpg") || path.EndsWith(".jpeg") || path.EndsWith(".png") || path.EndsWith(".webp") || path.EndsWith(".gif"))
+                return true;
+
+            // query'de uzantı olabilir
+            var q = uri.Query.ToLowerInvariant();
+            if (q.Contains(".jpg") || q.Contains(".jpeg") || q.Contains(".png") || q.Contains(".webp") || q.Contains(".gif"))
+                return true;
+
+            // son çare: http link + alan adı foto/resim diyorsa
+            return f.Contains("link");
+        }
+
+        // ============== THUMBNAILS & DRAG FILES ==============
+
+        private async Task LoadThumbAsync(string url, string key, ListViewItem row)
+        {
+            try
+            {
+                lock (_thumbLoading)
+                {
+                    if (_thumbLoading.Contains(url)) return;
+                    _thumbLoading.Add(url);
+                }
+
+                // 1) Görseli byte olarak al
+                byte[] bytes;
+
+                // mümkünse local cache’den oku
+                if (_localFileByUrl.TryGetValue(url, out var local) && File.Exists(local))
+                {
+                    bytes = await File.ReadAllBytesAsync(local);
+                }
+                else
+                {
+                    await _imgDlLock.WaitAsync();
+                    try
+                    {
+                        bytes = await _http.GetByteArrayAsync(url);
+                    }
+                    finally
+                    {
+                        _imgDlLock.Release();
+                    }
+
+                    // local cache’e yaz (drag-drop için de lazım)
+                    try
+                    {
+                        var path = EnsureLocalPathForUrl(url);
+                        if (!File.Exists(path))
+                            await File.WriteAllBytesAsync(path, bytes);
+
+                        _localFileByUrl[url] = path;
+                    }
+                    catch { /* cache yazamazsa sorun değil */ }
+                }
+
+                // 2) Bytes -> Image (stream’e bağlı kalmasın diye Bitmap’e kopyala)
+                using var ms = new MemoryStream(bytes);
+                using var tmp = Image.FromStream(ms, useEmbeddedColorManagement: false, validateImageData: false);
+                using var img = new Bitmap(tmp);
+
+                // 3) Thumb üret (bu zaten Bitmap döner)
+                var thumbBmp = (Bitmap)MakeThumb(img, _thumbs.ImageSize.Width, _thumbs.ImageSize.Height);
+
+                // 4) UI thread’de ImageList’e ekle (DISPOSE yemesin)
+                BeginInvoke(new Action(() =>
+                {
+                    try
+                    {
+                        if (!_thumbs.Images.ContainsKey(key))
+                        {
+                            _thumbs.Images.Add(key, thumbBmp); // ownership artık ImageList'te
+                        }
+                        else
+                        {
+                            thumbBmp.Dispose();
+                        }
+
+                        row.ImageKey = key;
+                        lv.Invalidate();
+                    }
+                    catch
+                    {
+                        thumbBmp.Dispose();
+                        throw;
+                    }
+                }));
+            }
+            catch (Exception ex)
+            {
+                LogWarn($"Thumb alınamadı: {ex.Message}");
+            }
+            finally
+            {
+                lock (_thumbLoading) _thumbLoading.Remove(url);
+            }
+        }
+
+        private string EnsureLocalPathForUrl(string url)
+        {
+            Directory.CreateDirectory(CacheDir);
+            var ext = GuessImageExtension(url);
+            var fileName = $"orderpeek_{Sha1(url)}{ext}";
+            return Path.Combine(CacheDir, fileName);
+        }
+
+
+        private string EnsureLocalImageFile(string url)
+        {
+            if (_localFileByUrl.TryGetValue(url, out var existing) && File.Exists(existing))
+                return existing;
+
+            Directory.CreateDirectory(CacheDir);
+
+            var ext = GuessImageExtension(url);
+            var fileName = $"orderpeek_{Sha1(url)}{ext}";
+            var fullPath = Path.Combine(CacheDir, fileName);
+
+            if (File.Exists(fullPath))
+            {
+                _localFileByUrl[url] = fullPath;
+                return fullPath;
+            }
+
+            // Synchronous download here (drag needs file NOW)
+            var bytes = _http.GetByteArrayAsync(url).GetAwaiter().GetResult();
+            File.WriteAllBytes(fullPath, bytes);
+
+            _localFileByUrl[url] = fullPath;
+            return fullPath;
+        }
+
+        private static string GuessImageExtension(string url)
+        {
+            try
+            {
+                var u = new Uri(url);
+                var p = u.AbsolutePath.ToLowerInvariant();
+                if (p.EndsWith(".jpeg")) return ".jpeg";
+                if (p.EndsWith(".jpg")) return ".jpg";
+                if (p.EndsWith(".png")) return ".png";
+                if (p.EndsWith(".webp")) return ".webp";
+                if (p.EndsWith(".gif")) return ".gif";
+            }
+            catch { }
+            return ".jpg";
+        }
+
+        private static string ThumbKey(string url) => "img_" + Sha1(url);
+
+        private static string Sha1(string s)
+        {
+            using var sha = SHA1.Create();
+            var bytes = sha.ComputeHash(Encoding.UTF8.GetBytes(s));
+            return Convert.ToHexString(bytes).ToLowerInvariant();
+        }
+
+        private static Image MakeThumb(Image src, int w, int h)
+        {
+            // oran koru
+            var scale = Math.Min((double)w / src.Width, (double)h / src.Height);
+            var nw = Math.Max(1, (int)(src.Width * scale));
+            var nh = Math.Max(1, (int)(src.Height * scale));
+
+            var bmp = new Bitmap(w, h);
+            using var g = Graphics.FromImage(bmp);
+            g.Clear(Color.White);
+            g.InterpolationMode = System.Drawing.Drawing2D.InterpolationMode.HighQualityBicubic;
+            g.SmoothingMode = System.Drawing.Drawing2D.SmoothingMode.HighQuality;
+            g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
+            g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
+
+            var x = (w - nw) / 2;
+            var y = (h - nh) / 2;
+            g.DrawImage(src, new Rectangle(x, y, nw, nh));
+            g.DrawRectangle(Pens.Gainsboro, 0, 0, w - 1, h - 1);
+            return bmp;
+        }
+
+        private static Image MakePlaceholderThumb()
+        {
+            var bmp = new Bitmap(48, 48);
+            using var g = Graphics.FromImage(bmp);
+            g.Clear(Color.WhiteSmoke);
+            g.DrawRectangle(Pens.Gainsboro, 0, 0, 47, 47);
+            using var f = new Font("Segoe UI", 7f, FontStyle.Bold);
+            var s = "IMG";
+            var sz = g.MeasureString(s, f);
+            g.DrawString(s, f, Brushes.Gray, (48 - sz.Width) / 2, (48 - sz.Height) / 2);
+            return bmp;
         }
 
         // ============== API LOW-LEVEL (THROTTLE + RETRY) ==============
@@ -590,9 +882,10 @@ namespace Çiçeksepeti_Order_Peek
 
         private sealed record CachedOrderItem(int OrderItemId, string ProductName, List<CachedPersonalization> Personalizations);
         private sealed record CachedPersonalization(string Field, string RawText);
-        private sealed record RowTag(string Field, string Raw);
 
-        // ============== NAME FORMATTER (NO TR CORRECTION, ONLY CASE) ==============
+        private sealed record RowTag(string Field, string Raw, bool IsImageUrl, string? LocalPath);
+
+        // ============== NAME FORMATTER (ONLY CASE, NO TR "CORRECTION") ==============
 
         private static class NameFormatter
         {
@@ -602,7 +895,6 @@ namespace Çiçeksepeti_Order_Peek
 
                 var raw = input.Trim();
 
-                // Birden fazla boşluğu tek boşluğa indir
                 var parts = Regex.Split(raw, @"\s+")
                                  .Where(p => !string.IsNullOrWhiteSpace(p))
                                  .ToArray();
@@ -610,7 +902,6 @@ namespace Çiçeksepeti_Order_Peek
                 if (parts.Length == 0) return raw;
                 if (parts.Length == 1) return TitleWord(parts[0]);
 
-                // Soyad (son kelime)
                 var surnameRaw = parts[^1];
                 var nameParts = parts.Take(parts.Length - 1).Select(TitleWord);
 
@@ -623,7 +914,6 @@ namespace Çiçeksepeti_Order_Peek
                 return string.Join(" ", nameParts.Append(surname));
             }
 
-            // Sadece "tamamı büyük" kontrolü
             private static bool IsAllLettersUpperInvariant(string s)
             {
                 bool hasLetter = false;
@@ -636,7 +926,6 @@ namespace Çiçeksepeti_Order_Peek
                 return hasLetter;
             }
 
-            // Tire ve apostrof gibi ayırıcıları koruyarak Title Case
             private static string TitleWord(string w)
             {
                 if (string.IsNullOrWhiteSpace(w)) return w;
@@ -644,15 +933,11 @@ namespace Çiçeksepeti_Order_Peek
                 string TitleToken(string token)
                 {
                     if (token.Length == 0) return token;
-
-                    // DİKKAT: Invariant => türkçe harf “düzeltme” yok.
-                    // Ek olarak: 'İ' -> 'i̇' gibi combining dot saçmalığını engelliyoruz.
                     var lower = ToLowerInvariantNoCombiningDot(token);
                     var first = char.ToUpperInvariant(lower[0]);
                     return lower.Length == 1 ? first.ToString() : first + lower.Substring(1);
                 }
 
-                // - ve ' ayırıcılarını koru
                 var pieces = Regex.Split(w, @"([\-'])");
                 for (int i = 0; i < pieces.Length; i++)
                 {
@@ -662,13 +947,12 @@ namespace Çiçeksepeti_Order_Peek
                 return string.Concat(pieces);
             }
 
-            // "İ" -> "i̇" üretmesin diye basit fix:
             private static string ToLowerInvariantNoCombiningDot(string s)
             {
                 var sb = new StringBuilder(s.Length);
                 foreach (var ch in s)
                 {
-                    if (ch == 'İ') sb.Append('i'); // düz "i" yap (harf düzeltme değil, case fix)
+                    if (ch == 'İ') sb.Append('i');
                     else sb.Append(char.ToLowerInvariant(ch));
                 }
                 return sb.ToString();
