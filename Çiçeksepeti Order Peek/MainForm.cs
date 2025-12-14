@@ -1,7 +1,6 @@
 using System;
 using System.Collections.Generic;
 using System.Drawing;
-using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Net.Http;
@@ -9,7 +8,6 @@ using System.Net.Http.Headers;
 using System.Security.Cryptography;
 using System.Text;
 using System.Text.Json;
-using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows.Forms;
@@ -46,7 +44,7 @@ namespace Çiçeksepeti_Order_Peek
         // Prefetch re-entry guard
         private readonly SemaphoreSlim _prefetchLock = new(1, 1);
 
-        // GetOrders global throttle (farklı request bile olsa 5 sn)
+        // GetOrders global throttle (tüm mağazalar için 5 sn kuralı)
         private static readonly SemaphoreSlim _getOrdersLock = new(1, 1);
         private static DateTime _lastGetOrdersUtc = DateTime.MinValue;
         private const int GetOrdersMinIntervalMs = 5100;
@@ -74,21 +72,32 @@ namespace Çiçeksepeti_Order_Peek
 
             Directory.CreateDirectory(CacheDir);
 
-            // Uygulama açılır açılmaz sipariş çekme yok.
-            // Sadece API key boşsa ayar ekranını aç.
             Shown += (_, __) =>
             {
-                if (string.IsNullOrWhiteSpace(_settings.ApiKey))
+                if (!HasAnyApiKey())
                 {
                     OpenSettings();
-                    if (string.IsNullOrWhiteSpace(_settings.ApiKey))
-                        SetStatus("API Key yok. ⚙ ile gir.");
+                    if (!HasAnyApiKey())
+                    {
+                        SetStatus("API Key yok. ⚙ ile en az bir mağaza ekle.");
+                    }
                 }
                 else
                 {
                     SetStatus("Hazır. ↻ ile cache çek, sonra alt sipariş no gir.");
                 }
             };
+        }
+
+        private bool HasAnyApiKey()
+        {
+            if (_settings.Stores != null && _settings.Stores.Any(s => !string.IsNullOrWhiteSpace(s.ApiKey)))
+                return true;
+
+            if (!string.IsNullOrWhiteSpace(_settings.ApiKey))
+                return true;
+
+            return false;
         }
 
         private void BuildUi()
@@ -149,9 +158,7 @@ namespace Çiçeksepeti_Order_Peek
             lv.View = View.Details;
             lv.FullRowSelect = true;
             lv.GridLines = true;
-
-            // FOTO için çoklu seçim şart
-            lv.MultiSelect = true;
+            lv.MultiSelect = true; // foto için çoklu seçim lazım
 
             lv.Font = new Font("Segoe UI", 8.5f);
             lv.SmallImageList = _thumbs;
@@ -163,20 +170,19 @@ namespace Çiçeksepeti_Order_Peek
             lv.Columns.Add("Alan", 150);
             lv.Columns.Add("Müşteri", 160);
 
-            // Tek seçimde kopyala (çoklu seçimde kopyalama yapma)
+            // Tek seçimde panoya kopya (RAW, hiçbir format yok)
             lv.ItemSelectionChanged += (_, __) =>
             {
                 if (lv.SelectedItems.Count != 1) return;
                 if (lv.SelectedItems[0].Tag is not RowTag tag) return;
                 if (string.IsNullOrWhiteSpace(tag.Raw)) return;
 
-                var toCopy = FormatForCopy(tag.Field, tag.Raw);
-                Clipboard.SetText(toCopy);
+                Clipboard.SetText(tag.Raw);
                 SetStatus("Değer kopyalandı ✅");
                 LogOk("Seçili değer panoya kopyalandı.");
             };
 
-            // Foto sürükle-bırak
+            // Foto sürükle-bırak (sadece image url’leri file-drop olarak)
             lv.ItemDrag += (_, e) =>
             {
                 try
@@ -191,7 +197,7 @@ namespace Çiçeksepeti_Order_Peek
 
                     if (urls.Count == 0)
                     {
-                        // Foto seçili değilse drag yapma (metin sürükleme istemedin)
+                        // Foto seçili değilse drag yapma (metin sürükleme istemiyoruz)
                         return;
                     }
 
@@ -212,11 +218,8 @@ namespace Çiçeksepeti_Order_Peek
                         return;
                     }
 
-                    // Photoshop/Explorer için FileDrop
                     var data = new DataObject();
                     data.SetData(DataFormats.FileDrop, files.ToArray());
-
-                    // Bonus: bazı uygulamalar URL text sever
                     data.SetData(DataFormats.UnicodeText, string.Join(Environment.NewLine, urls));
 
                     SetStatus("Sürükleyebilirsin ✅");
@@ -297,13 +300,13 @@ namespace Çiçeksepeti_Order_Peek
             }
 
             if (m.Contains("401") || m.Contains("403"))
-                LogErr("Ne yapmalı: API Key yanlış/eksik. ⚙ → x-api-key’i kontrol et. Sandbox açık/kapalı doğru mu bak.");
+                LogErr("Ne yapmalı: API Key yanlış/eksik. ⚙ → Ayarlardan mağaza anahtarlarını kontrol et.");
 
             if (m.Contains("429"))
-                LogErr("Ne yapmalı: Rate limit. 5 saniye bekle, sonra tekrar dene.");
+                LogErr("Ne yapmalı: Rate limit. 5 saniye bekleyip tekrar dene.");
 
             if (m.Contains("400"))
-                LogErr("Ne yapmalı: İstek hatalı. orderItemNo sayı mı? Sandbox/prod doğru mu?");
+                LogErr("Ne yapmalı: İstek hatalı. Tarih aralığı ya da parametreler yanlış olabilir.");
 
             if (m.Contains("timeout") || m.Contains("timed out") || m.Contains("taskcanceled"))
                 LogErr("Ne yapmalı: Zaman aşımı. İnternet yavaş veya API yoğun. Biraz sonra tekrar dene.");
@@ -324,7 +327,7 @@ namespace Çiçeksepeti_Order_Peek
                 return;
             }
 
-            // Cache hit
+            // Sadece cache’den bakıyoruz.
             if (_cacheByOrderItemId.TryGetValue(orderItemId, out var cached))
             {
                 RenderPersonalizations(cached);
@@ -334,48 +337,24 @@ namespace Çiçeksepeti_Order_Peek
                 return;
             }
 
-            // Cache yoksa API (tek atımlık)
-            SetStatus("Cache’de yok → API’den sorguluyorum…");
+            // Cache’de yok → API’ye tekil sorgu YOK.
+            SetStatus("Cache’de yok.");
             LogWarn($"Cache miss: {orderItemId}");
 
-            try
-            {
-                var resp = await ApiGetOrdersAsync(
-                    new { pageSize = 100, page = 0, orderItemNo = orderItemId },
-                    CancellationToken.None);
-
-                var found = resp?.SupplierOrderListWithBranch?.FirstOrDefault(x => x.OrderItemId == orderItemId)
-                           ?? resp?.SupplierOrderListWithBranch?.FirstOrDefault();
-
-                if (found == null)
-                {
-                    SetStatus("Bulunamadı.");
-                    LogWarn("API response boş/uyuşmadı.");
-                    return;
-                }
-
-                var cacheItem = ToCached(found);
-                _cacheByOrderItemId[cacheItem.OrderItemId] = cacheItem;
-
-                RenderPersonalizations(cacheItem);
-                CopyOnlyPersonalizationValues(cacheItem);
-                SetStatus("API’den bulundu ✅");
-                LogOk($"API ok: {orderItemId}");
-            }
-            catch (Exception ex)
-            {
-                SetStatus("API hata ❌");
-                LogErr(ex.Message);
-                LogWhatToDo(ex);
-                LogErr(ex.ToString());
-            }
+            MessageBox.Show(
+                "Bu alt sipariş numarası mevcut cache aralığında bulunamadı.\n\n" +
+                "Yeni siparişler gelmiş olabilir.\n" +
+                "Lütfen ↻ ile cache’i güncelleyip sonra tekrar deneyin.",
+                "Sipariş bulunamadı",
+                MessageBoxButtons.OK,
+                MessageBoxIcon.Information);
         }
 
         private async Task PrefetchRangeAsync(bool force = false)
         {
-            if (string.IsNullOrWhiteSpace(_settings.ApiKey))
+            if (!HasAnyApiKey())
             {
-                SetStatus("API Key yok. ⚙ ile gir.");
+                SetStatus("API Key yok. ⚙ ile en az bir mağaza ekle.");
                 return;
             }
 
@@ -394,7 +373,7 @@ namespace Çiçeksepeti_Order_Peek
 
             try
             {
-                // AYARLARDAN OKU
+                // Ayarlardan aralığı oku
                 var pastDays = Math.Max(0, _settings.PrefetchPastDays);
                 var futureDays = Math.Max(0, _settings.PrefetchFutureDays);
 
@@ -402,36 +381,62 @@ namespace Çiçeksepeti_Order_Peek
                 var start = now.AddDays(-pastDays);
                 var end = now.AddDays(+futureDays);
 
-                SetStatus($"Siparişler çekiliyor… ({pastDays} gün geri, {futureDays} gün ileri)");
-                LogInfo($"Prefetch range: {start:O} -> {end:O}");
+                var stores = (_settings.Stores ?? new List<StoreConfig>())
+                    .Where(s => !string.IsNullOrWhiteSpace(s.ApiKey))
+                    .ToList();
 
-                int page = 0;
+                // Eski tekli ayarlardan otomatik varsayılan mağaza türet
+                if (stores.Count == 0 && !string.IsNullOrWhiteSpace(_settings.ApiKey))
+                {
+                    stores.Add(new StoreConfig
+                    {
+                        Name = "Varsayılan Mağaza",
+                        ApiKey = _settings.ApiKey,
+                        UseSandbox = _settings.UseSandbox
+                    });
+                }
+
+                if (stores.Count == 0)
+                {
+                    SetStatus("Geçerli API key içeren mağaza yok. Ayarlara bak.");
+                    return;
+                }
+
+                SetStatus($"Siparişler çekiliyor… ({pastDays} gün geri, {futureDays} gün ileri, {stores.Count} mağaza)");
+                LogInfo($"Prefetch range: {start:O} -> {end:O}, stores={stores.Count}");
+
                 int before = _cacheByOrderItemId.Count;
 
-                while (true)
+                foreach (var store in stores)
                 {
-                    _cts.Token.ThrowIfCancellationRequested();
+                    LogInfo($"Mağaza: {store.Name} (Sandbox={store.UseSandbox})");
+                    int page = 0;
 
-                    var body = new
+                    while (true)
                     {
-                        startDate = start.ToString("O"),
-                        endDate = end.ToString("O"),
-                        pageSize = 100,
-                        page = page
-                    };
+                        _cts.Token.ThrowIfCancellationRequested();
 
-                    var resp = await ApiGetOrdersAsync(body, _cts.Token);
-                    var list = resp?.SupplierOrderListWithBranch ?? new List<OrderItem>();
-                    if (list.Count == 0) break;
+                        var body = new
+                        {
+                            startDate = start.ToString("O"),
+                            endDate = end.ToString("O"),
+                            pageSize = 100,
+                            page = page
+                        };
 
-                    foreach (var oi in list)
-                    {
-                        var c = ToCached(oi);
-                        _cacheByOrderItemId[c.OrderItemId] = c;
+                        var resp = await ApiGetOrdersAsync(store, body, _cts.Token);
+                        var list = resp?.SupplierOrderListWithBranch ?? new List<OrderItem>();
+                        if (list.Count == 0) break;
+
+                        foreach (var oi in list)
+                        {
+                            var c = ToCached(oi);
+                            _cacheByOrderItemId[c.OrderItemId] = c;
+                        }
+
+                        LogInfo($"  {store.Name}: Page {page} -> {list.Count} kayıt (global cache: {_cacheByOrderItemId.Count})");
+                        page++;
                     }
-
-                    LogInfo($"Page {page} -> {list.Count} kayıt (cache: {_cacheByOrderItemId.Count})");
-                    page++;
                 }
 
                 _lastPrefetchUtc = DateTime.UtcNow;
@@ -487,18 +492,15 @@ namespace Çiçeksepeti_Order_Peek
                     bool isImg = LooksLikeImageUrl(field, raw);
 
                     var row = new ListViewItem(field);
-                    row.SubItems.Add(raw); // ekranda RAW
+                    row.SubItems.Add(raw);
                     row.Tag = new RowTag(field, raw, isImg, null);
 
                     if (isImg)
                     {
                         row.ImageKey = PlaceholderKey;
-
-                        // thumbnail yükle (asenkron)
                         var url = raw.Trim();
                         var key = ThumbKey(url);
-                        row.Name = key; // item identity gibi kullanacağız
-
+                        row.Name = key;
                         _ = LoadThumbAsync(url, key, row);
                     }
 
@@ -513,40 +515,13 @@ namespace Çiçeksepeti_Order_Peek
 
         private void CopyOnlyPersonalizationValues(CachedOrderItem item)
         {
-            // SADECE değerler kopyalanır.
-            // isim/ad soyad alanları "harf düzeltmeden" sadece büyük-küçük ile formatlanır.
             var values = item.Personalizations
-                .Select(x => (x.Field ?? "", (x.RawText ?? "").Trim()))
-                .Where(t => !string.IsNullOrWhiteSpace(t.Item2))
-                .Select(t => FormatForCopy(t.Item1, t.Item2))
+                .Select(x => (x.RawText ?? "").Trim())
+                .Where(x => !string.IsNullOrWhiteSpace(x))
                 .ToList();
 
             Clipboard.SetText(values.Count == 0 ? "" : string.Join(Environment.NewLine, values));
             LogInfo(values.Count == 0 ? "Kopya: boş" : $"Kopya: {values.Count} satır");
-        }
-
-        private static string FormatForCopy(string field, string raw)
-        {
-            if (!LooksLikeNameField(field)) return raw;
-
-            // KURAL: harf “düzeltme” yok, sadece büyük-küçük.
-            // yilmaz -> Yilmaz (Yılmaz değil)
-            return NameFormatter.FormatCustomerNameInvariant(raw);
-        }
-
-        private static bool LooksLikeNameField(string field)
-        {
-            if (string.IsNullOrWhiteSpace(field)) return false;
-            var f = field.Trim().ToLowerInvariant();
-
-            return f.Contains("isim")
-                || f.Contains("ad soyad")
-                || f.Contains("adı soyadı")
-                || f.Contains("ad-soyad")
-                || f.Contains("isim soyisim")
-                || f.Contains("name")
-                || f.Contains("full name")
-                || f.Contains("fullname");
         }
 
         private static bool LooksLikeImageUrl(string field, string raw)
@@ -560,17 +535,14 @@ namespace Çiçeksepeti_Order_Peek
             if (f.Contains("foto") || f.Contains("resim") || f.Contains("photo") || f.Contains("image"))
                 return true;
 
-            // uzantı/koku
             var path = uri.AbsolutePath.ToLowerInvariant();
             if (path.EndsWith(".jpg") || path.EndsWith(".jpeg") || path.EndsWith(".png") || path.EndsWith(".webp") || path.EndsWith(".gif"))
                 return true;
 
-            // query'de uzantı olabilir
             var q = uri.Query.ToLowerInvariant();
             if (q.Contains(".jpg") || q.Contains(".jpeg") || q.Contains(".png") || q.Contains(".webp") || q.Contains(".gif"))
                 return true;
 
-            // son çare: http link + alan adı foto/resim diyorsa
             return f.Contains("link");
         }
 
@@ -586,10 +558,8 @@ namespace Çiçeksepeti_Order_Peek
                     _thumbLoading.Add(url);
                 }
 
-                // 1) Görseli byte olarak al
                 byte[] bytes;
 
-                // mümkünse local cache’den oku
                 if (_localFileByUrl.TryGetValue(url, out var local) && File.Exists(local))
                 {
                     bytes = await File.ReadAllBytesAsync(local);
@@ -606,7 +576,6 @@ namespace Çiçeksepeti_Order_Peek
                         _imgDlLock.Release();
                     }
 
-                    // local cache’e yaz (drag-drop için de lazım)
                     try
                     {
                         var path = EnsureLocalPathForUrl(url);
@@ -615,25 +584,22 @@ namespace Çiçeksepeti_Order_Peek
 
                         _localFileByUrl[url] = path;
                     }
-                    catch { /* cache yazamazsa sorun değil */ }
+                    catch { }
                 }
 
-                // 2) Bytes -> Image (stream’e bağlı kalmasın diye Bitmap’e kopyala)
                 using var ms = new MemoryStream(bytes);
                 using var tmp = Image.FromStream(ms, useEmbeddedColorManagement: false, validateImageData: false);
                 using var img = new Bitmap(tmp);
 
-                // 3) Thumb üret (bu zaten Bitmap döner)
                 var thumbBmp = (Bitmap)MakeThumb(img, _thumbs.ImageSize.Width, _thumbs.ImageSize.Height);
 
-                // 4) UI thread’de ImageList’e ekle (DISPOSE yemesin)
                 BeginInvoke(new Action(() =>
                 {
                     try
                     {
                         if (!_thumbs.Images.ContainsKey(key))
                         {
-                            _thumbs.Images.Add(key, thumbBmp); // ownership artık ImageList'te
+                            _thumbs.Images.Add(key, thumbBmp);
                         }
                         else
                         {
@@ -668,7 +634,6 @@ namespace Çiçeksepeti_Order_Peek
             return Path.Combine(CacheDir, fileName);
         }
 
-
         private string EnsureLocalImageFile(string url)
         {
             if (_localFileByUrl.TryGetValue(url, out var existing) && File.Exists(existing))
@@ -686,7 +651,6 @@ namespace Çiçeksepeti_Order_Peek
                 return fullPath;
             }
 
-            // Synchronous download here (drag needs file NOW)
             var bytes = _http.GetByteArrayAsync(url).GetAwaiter().GetResult();
             File.WriteAllBytes(fullPath, bytes);
 
@@ -721,7 +685,6 @@ namespace Çiçeksepeti_Order_Peek
 
         private static Image MakeThumb(Image src, int w, int h)
         {
-            // oran koru
             var scale = Math.Min((double)w / src.Width, (double)h / src.Height);
             var nw = Math.Max(1, (int)(src.Width * scale));
             var nh = Math.Max(1, (int)(src.Height * scale));
@@ -754,11 +717,11 @@ namespace Çiçeksepeti_Order_Peek
             return bmp;
         }
 
-        // ============== API LOW-LEVEL (THROTTLE + RETRY) ==============
+        // ============== API LOW-LEVEL (THROTTLE + RETRY, MAĞAZA BAZLI URL/KEY) ==============
 
-        private async Task<GetOrdersResponse> ApiGetOrdersAsync(object body, CancellationToken ct)
+        private async Task<GetOrdersResponse> ApiGetOrdersAsync(StoreConfig store, object body, CancellationToken ct)
         {
-            var url = $"{_settings.BaseUrl}/api/v1/Order/GetOrders";
+            var url = $"{store.BaseUrl}/api/v1/Order/GetOrders";
             var jsonBody = JsonSerializer.Serialize(body);
 
             for (int attempt = 0; attempt < 3; attempt++)
@@ -766,7 +729,6 @@ namespace Çiçeksepeti_Order_Peek
                 await _getOrdersLock.WaitAsync(ct);
                 try
                 {
-                    // 5 sn dolmadan asla istek atma
                     var elapsedMs = (int)(DateTime.UtcNow - _lastGetOrdersUtc).TotalMilliseconds;
                     var waitMs = GetOrdersMinIntervalMs - elapsedMs;
                     if (waitMs > 0) await Task.Delay(waitMs, ct);
@@ -774,7 +736,7 @@ namespace Çiçeksepeti_Order_Peek
                     _lastGetOrdersUtc = DateTime.UtcNow;
 
                     using var req = new HttpRequestMessage(HttpMethod.Post, url);
-                    req.Headers.Add("x-api-key", _settings.ApiKey);
+                    req.Headers.Add("x-api-key", store.ApiKey);
                     req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
                     req.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
 
@@ -787,11 +749,10 @@ namespace Çiçeksepeti_Order_Peek
                         return parsed ?? throw new Exception("Response parse edilemedi (null).");
                     }
 
-                    // Rate limit bazen 400 ile dönüyor
                     if (json.Contains("Limit aşımı", StringComparison.OrdinalIgnoreCase))
                     {
                         var sec = ParseRemainingSeconds(json);
-                        LogWarn($"Rate limit: {sec}s bekleyip tekrar deneyeceğim…");
+                        LogWarn($"Rate limit ({store.Name}): {sec}s bekleyip tekrar deneyeceğim…");
                         await Task.Delay(Math.Max(1000, sec * 1000 + 250), ct);
                         continue;
                     }
@@ -861,9 +822,8 @@ namespace Çiçeksepeti_Order_Peek
                 if (result == DialogResult.OK)
                 {
                     SettingsStore.Save(_settings);
-                    SetStatus($"Ayarlar kaydedildi. Sandbox={_settings.UseSandbox}  Range=-{_settings.PrefetchPastDays}/+{_settings.PrefetchFutureDays}");
+                    SetStatus($"Ayarlar kaydedildi. Mağaza sayısı={_settings.Stores?.Count ?? 0}  Range=-{_settings.PrefetchPastDays}/+{_settings.PrefetchFutureDays}");
                     LogOk("Ayarlar kaydedildi.");
-                    // Otomatik prefetch YOK. Kullanıcı ↻ basacak.
                 }
                 else
                 {
@@ -882,81 +842,6 @@ namespace Çiçeksepeti_Order_Peek
 
         private sealed record CachedOrderItem(int OrderItemId, string ProductName, List<CachedPersonalization> Personalizations);
         private sealed record CachedPersonalization(string Field, string RawText);
-
         private sealed record RowTag(string Field, string Raw, bool IsImageUrl, string? LocalPath);
-
-        // ============== NAME FORMATTER (ONLY CASE, NO TR "CORRECTION") ==============
-
-        private static class NameFormatter
-        {
-            public static string FormatCustomerNameInvariant(string input)
-            {
-                if (string.IsNullOrWhiteSpace(input)) return input ?? "";
-
-                var raw = input.Trim();
-
-                var parts = Regex.Split(raw, @"\s+")
-                                 .Where(p => !string.IsNullOrWhiteSpace(p))
-                                 .ToArray();
-
-                if (parts.Length == 0) return raw;
-                if (parts.Length == 1) return TitleWord(parts[0]);
-
-                var surnameRaw = parts[^1];
-                var nameParts = parts.Take(parts.Length - 1).Select(TitleWord);
-
-                bool surnameWasAllCaps = IsAllLettersUpperInvariant(surnameRaw);
-
-                var surname = surnameWasAllCaps
-                    ? surnameRaw.ToUpperInvariant()
-                    : TitleWord(surnameRaw);
-
-                return string.Join(" ", nameParts.Append(surname));
-            }
-
-            private static bool IsAllLettersUpperInvariant(string s)
-            {
-                bool hasLetter = false;
-                foreach (var ch in s)
-                {
-                    if (!char.IsLetter(ch)) continue;
-                    hasLetter = true;
-                    if (char.ToUpperInvariant(ch) != ch) return false;
-                }
-                return hasLetter;
-            }
-
-            private static string TitleWord(string w)
-            {
-                if (string.IsNullOrWhiteSpace(w)) return w;
-
-                string TitleToken(string token)
-                {
-                    if (token.Length == 0) return token;
-                    var lower = ToLowerInvariantNoCombiningDot(token);
-                    var first = char.ToUpperInvariant(lower[0]);
-                    return lower.Length == 1 ? first.ToString() : first + lower.Substring(1);
-                }
-
-                var pieces = Regex.Split(w, @"([\-'])");
-                for (int i = 0; i < pieces.Length; i++)
-                {
-                    if (pieces[i] == "-" || pieces[i] == "'") continue;
-                    pieces[i] = TitleToken(pieces[i]);
-                }
-                return string.Concat(pieces);
-            }
-
-            private static string ToLowerInvariantNoCombiningDot(string s)
-            {
-                var sb = new StringBuilder(s.Length);
-                foreach (var ch in s)
-                {
-                    if (ch == 'İ') sb.Append('i');
-                    else sb.Append(char.ToLowerInvariant(ch));
-                }
-                return sb.ToString();
-            }
-        }
     }
 }
