@@ -181,6 +181,7 @@ namespace Çiçeksepeti_Order_Peek
                 DialogResult = DialogResult.OK
             };
 
+
             btnOk.Click += (_, __) =>
             {
                 SaveCurrentStoreFromFields();
@@ -188,11 +189,36 @@ namespace Çiçeksepeti_Order_Peek
                 _settings.PrefetchFutureDays = (int)numFuture.Value;
             };
 
+            
+
+
+            var btnUpdate = new Button
+            {
+                Text = "Güncelleme Kontrol Et",
+                Left = 230,
+                Width = 120,
+                Top = 30
+            };
+
+            btnUpdate.Click += async (_, __) =>
+            {
+                btnUpdate.Enabled = false;
+                try
+                {
+                    await Updater.CheckAndUpdateAsync(this);
+                }
+                finally
+                {
+                    btnUpdate.Enabled = true;
+                }
+            };
+
             bottom.Controls.Add(lblPast);
             bottom.Controls.Add(numPast);
             bottom.Controls.Add(lblFuture);
             bottom.Controls.Add(numFuture);
             bottom.Controls.Add(hint);
+            bottom.Controls.Add(btnUpdate); // ← BUNU EKLE
             bottom.Controls.Add(btnOk);
 
             // === Form Controls ===
