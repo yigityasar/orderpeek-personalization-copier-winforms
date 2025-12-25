@@ -34,6 +34,10 @@ namespace Çiçeksepeti_Order_Peek
         private readonly Label lblStatus = new();
         private readonly RichTextBox txtLog = new();
 
+        // ÜRÜN HEADER (sadece ürün adı)
+        private readonly Panel _productPanel = new();
+        private readonly Label _lblProductTitle = new();
+
         // Record list UI
         private readonly Panel _recordPanel = new();
         private readonly ListBox _recordList = new();
@@ -87,7 +91,6 @@ namespace Çiçeksepeti_Order_Peek
         private readonly Color ColorAccent = Color.FromArgb(255, 111, 0);    // turuncu aksan
         private readonly Color ColorAccentSoft = Color.FromArgb(255, 236, 217);  // yumuşak turuncu
         private readonly Color ColorLogBg = Color.FromArgb(253, 253, 255);  // log arka plan
-        private readonly Color ColorListBorder = Color.FromArgb(222, 226, 230);  // listview sınırı
 
         private enum StatusKind
         {
@@ -157,6 +160,22 @@ namespace Çiçeksepeti_Order_Peek
             btn.Margin = new Padding(2, 0, 0, 0);
         }
 
+        private void InitProductHeaderUi()
+        {
+            _productPanel.Dock = DockStyle.Top;
+            _productPanel.Height = 32; // küçük, sade bar
+            _productPanel.Padding = new Padding(8, 2, 8, 2);
+            _productPanel.BackColor = Color.FromArgb(40, 44, 52); // üst barla uyumlu koyu ton
+            _productPanel.Visible = false;
+
+            _lblProductTitle.Dock = DockStyle.Fill;
+            _lblProductTitle.TextAlign = ContentAlignment.MiddleLeft;
+            _lblProductTitle.Font = new Font("Segoe UI", 7.5f, FontStyle.Regular); // küçük font
+            _lblProductTitle.ForeColor = Color.White;
+            _lblProductTitle.AutoEllipsis = true;
+
+            _productPanel.Controls.Add(_lblProductTitle);
+        }
 
         private void BuildUi()
         {
@@ -265,6 +284,9 @@ namespace Çiçeksepeti_Order_Peek
             topPanel.Controls.Add(btnRecord);
             topPanel.Controls.Add(btnCancel);
 
+            // ÜRÜN HEADER UI
+            InitProductHeaderUi();
+
             // Liste
             lv.Dock = DockStyle.Fill;
             lv.View = View.Details;
@@ -370,7 +392,7 @@ namespace Çiçeksepeti_Order_Peek
             txtLog.ReadOnly = true;
             txtLog.ScrollBars = RichTextBoxScrollBars.Vertical;
             txtLog.Dock = DockStyle.Bottom;
-            txtLog.Height = 70;
+            txtLog.Height = 70; // küçültülmüş
             txtLog.Font = new Font("Consolas", 7.75f);
             txtLog.BackColor = ColorLogBg;
             txtLog.ForeColor = Color.FromArgb(60, 60, 60);
@@ -380,19 +402,19 @@ namespace Çiçeksepeti_Order_Peek
             // STATUS BAR
             lblStatus.Text = "Hazır.";
             lblStatus.Dock = DockStyle.Bottom;
-            lblStatus.AutoSize = false;                         // Boyutu biz kontrol edeceğiz
-            lblStatus.Height = 26;                              // İstediğin kadar yükselt
-            lblStatus.Font = new Font("Segoe UI", 8.0f);        // Yazı boyutunu da küçült
+            lblStatus.AutoSize = false;
+            lblStatus.Height = 26;
+            lblStatus.Font = new Font("Segoe UI", 8.0f);
             lblStatus.Padding = new Padding(8, 4, 8, 4);
-            lblStatus.TextAlign = ContentAlignment.MiddleLeft;  // Dikey ortalansın
+            lblStatus.TextAlign = ContentAlignment.MiddleLeft;
 
             Controls.Clear();
             Controls.Add(lv);
             Controls.Add(_recordPanel);
             Controls.Add(txtLog);
             Controls.Add(lblStatus);
+            Controls.Add(_productPanel);   // üst barın hemen altı
             Controls.Add(topPanel);
-
         }
 
         private void ApplyAlwaysOnTopBottomRight()
@@ -670,6 +692,7 @@ namespace Çiçeksepeti_Order_Peek
             }
             else
             {
+                ClearProductHeader();
                 SetStatus("Cache’de bulunamadı.", StatusKind.Warn);
                 LogWarn($"Cache miss (tekil API sorgusu YOK): {orderItemId}");
 
@@ -711,6 +734,8 @@ namespace Çiçeksepeti_Order_Peek
 
             try
             {
+                ClearProductHeader();
+
                 var pastDays = Math.Max(0, _settings.PrefetchPastDays);
                 var futureDays = Math.Max(0, _settings.PrefetchFutureDays);
 
@@ -786,10 +811,42 @@ namespace Çiçeksepeti_Order_Peek
             }
         }
 
+        // ============== ÜRÜN HEADER GÜNCELLEME ==============
+
+        private void UpdateProductHeader(CachedOrderItem item)
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(() => UpdateProductHeader(item)));
+                return;
+            }
+
+            _lblProductTitle.Text = string.IsNullOrWhiteSpace(item.ProductName)
+                ? "(Ürün adı yok)"
+                : Shorten(item.ProductName, 80);
+
+            _productPanel.Visible = true;
+        }
+
+        private void ClearProductHeader()
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(ClearProductHeader));
+                return;
+            }
+
+            _lblProductTitle.Text = "";
+            _productPanel.Visible = false;
+        }
+
         // ============== RENDER + COPY ==============
 
         private void RenderPersonalizations(CachedOrderItem item)
         {
+            // ürün header'ı da güncelle
+            UpdateProductHeader(item);
+
             lv.BeginUpdate();
             try
             {
