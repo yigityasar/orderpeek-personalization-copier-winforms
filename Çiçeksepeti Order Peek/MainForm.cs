@@ -28,9 +28,19 @@ namespace Çiçeksepeti_Order_Peek
         private readonly Button btnCancel = new();
         private readonly Button btnRecord = new();
         private readonly Button btnPlayback = new();
+        private readonly Button btnPrev = new();
+        private readonly Button btnNext = new();
         private readonly ListView lv = new();
         private readonly Label lblStatus = new();
         private readonly RichTextBox txtLog = new();
+
+        // Record list UI
+        private readonly Panel _recordPanel = new();
+        private readonly ListBox _recordList = new();
+        private string _baseTitle = "Çiçeksepeti Order Peek";
+
+        // ToolTip
+        private readonly ToolTip _toolTip = new();
 
         // Thumbnails
         private readonly ImageList _thumbs = new()
@@ -46,7 +56,7 @@ namespace Çiçeksepeti_Order_Peek
         // Prefetch re-entry guard
         private readonly SemaphoreSlim _prefetchLock = new(1, 1);
 
-        // GetOrders global throttle (farklı request bile olsa 5 sn)
+        // GetOrders global throttle
         private static readonly SemaphoreSlim _getOrdersLock = new(1, 1);
         private static DateTime _lastGetOrdersUtc = DateTime.MinValue;
         private const int GetOrdersMinIntervalMs = 5100;
@@ -59,7 +69,7 @@ namespace Çiçeksepeti_Order_Peek
         // Image download/cache
         private readonly Dictionary<string, string> _localFileByUrl = new(StringComparer.OrdinalIgnoreCase);
         private readonly HashSet<string> _thumbLoading = new(StringComparer.OrdinalIgnoreCase);
-        private readonly SemaphoreSlim _imgDlLock = new(3, 3); // aynı anda max 3 download
+        private readonly SemaphoreSlim _imgDlLock = new(3, 3);
 
         private static string CacheDir =>
             Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
@@ -71,6 +81,22 @@ namespace Çiçeksepeti_Order_Peek
         private readonly List<int> _recordedOrderItemNos = new();
         private int _recordIndex = -1;
 
+        // RENK TEMASI
+        private readonly Color ColorBg = Color.FromArgb(248, 249, 252);  // genel arka plan
+        private readonly Color ColorTopBar = Color.FromArgb(33, 37, 41);     // üst bar
+        private readonly Color ColorAccent = Color.FromArgb(255, 111, 0);    // turuncu aksan
+        private readonly Color ColorAccentSoft = Color.FromArgb(255, 236, 217);  // yumuşak turuncu
+        private readonly Color ColorLogBg = Color.FromArgb(253, 253, 255);  // log arka plan
+        private readonly Color ColorListBorder = Color.FromArgb(222, 226, 230);  // listview sınırı
+
+        private enum StatusKind
+        {
+            Info,
+            Ok,
+            Warn,
+            Error
+        }
+
         public MainForm()
         {
             _settings = SettingsStore.Load();
@@ -79,39 +105,83 @@ namespace Çiçeksepeti_Order_Peek
             ApplyAlwaysOnTopBottomRight();
             Directory.CreateDirectory(CacheDir);
 
-            KeyPreview = true; // ok tuşları formda yakalansın
+            KeyPreview = true;
 
-            // Uygulama açılır açılmaz sipariş çekme yok.
-            // Sadece API key boşsa ayar ekranını aç.
+            UpdatePlaybackButtonsUI();
+
             Shown += (_, __) =>
             {
-                if (string.IsNullOrWhiteSpace(_settings.ApiKey))
+                var stores = GetActiveStores();
+                if (stores.Count == 0)
                 {
                     OpenSettings();
-                    if (string.IsNullOrWhiteSpace(_settings.ApiKey))
-                        SetStatus("API Key yok. ⚙ ile gir.");
+                    stores = GetActiveStores();
+
+                    if (stores.Count == 0)
+                        SetStatus("Hiç mağaza için API Key yok. ⚙ ile ekle.", StatusKind.Warn);
+                    else
+                        SetStatus("Hazır. ↻ ile cache çek, sonra alt sipariş no gir.", StatusKind.Ok);
                 }
                 else
                 {
-                    SetStatus("Hazır. ↻ ile cache çek, sonra alt sipariş no gir.");
+                    SetStatus("Hazır. ↻ ile cache çek, sonra alt sipariş no gir.", StatusKind.Ok);
                 }
             };
         }
 
+        // Üst bar butonlarını tek yerden boyamak için helper
+        private void StyleTopButton(Button btn, bool accent = false)
+        {
+            btn.FlatStyle = FlatStyle.Flat;
+
+            // ÇERÇEVE
+            btn.FlatAppearance.BorderSize = 1;
+            btn.FlatAppearance.BorderColor = accent
+                ? Color.FromArgb(255, 189, 140)   // turuncu buton için çerçeve
+                : Color.FromArgb(90, 96, 104);    // normal butonlar için koyu gri çerçeve
+
+            // Hover / pressed renkleri
+            btn.FlatAppearance.MouseOverBackColor = accent
+                ? Color.FromArgb(255, 128, 32)
+                : Color.FromArgb(55, 59, 65);
+
+            btn.FlatAppearance.MouseDownBackColor = accent
+                ? Color.FromArgb(230, 90, 10)
+                : Color.FromArgb(23, 27, 33);
+
+            // Normal arka plan & yazı rengi
+            btn.BackColor = accent ? ColorAccent : ColorTopBar;
+            btn.ForeColor = Color.White;
+
+            // Butonlar arası ufak boşluk
+            btn.Margin = new Padding(2, 0, 0, 0);
+        }
+
+
         private void BuildUi()
         {
             Text = "Çiçeksepeti Order Peek";
+            _baseTitle = Text;
+
             FormBorderStyle = FormBorderStyle.FixedToolWindow;
             TopMost = true;
-            Width = 360;
-            Height = 440;
+            Width = 380;
+            Height = 400;
+            BackColor = ColorBg;
+
+            // TOOLTIP
+            _toolTip.InitialDelay = 1000;   // 1 sn
+            _toolTip.ReshowDelay = 500;
+            _toolTip.AutoPopDelay = 10000;
+            _toolTip.ShowAlways = true;
 
             // ÜST BAR
             var topPanel = new Panel
             {
                 Dock = DockStyle.Top,
                 Height = 46,
-                Padding = new Padding(8, 8, 8, 6)
+                Padding = new Padding(8, 8, 8, 6),
+                BackColor = ColorTopBar
             };
 
             txtOrderItemNo.PlaceholderText = "Alt Sipariş No (orderItemNo) - Enter";
@@ -125,40 +195,72 @@ namespace Çiçeksepeti_Order_Peek
                     await LookupAndRenderAsync();
                 }
             };
+            txtOrderItemNo.BorderStyle = BorderStyle.FixedSingle;
+            txtOrderItemNo.BackColor = Color.White;
+            txtOrderItemNo.ForeColor = Color.Black;
+            _toolTip.SetToolTip(txtOrderItemNo, "Alt sipariş numarasını yazıp Enter'a bas.");
 
             btnCancel.Text = "✕";
             btnCancel.Dock = DockStyle.Right;
-            btnCancel.Width = 34;
+            btnCancel.Width = 30;
             btnCancel.Enabled = false;
             btnCancel.Click += (_, __) =>
             {
                 _cts?.Cancel();
                 LogWarn("İptal istendi.");
             };
-
-            btnRefresh.Text = "↻";
-            btnRefresh.Dock = DockStyle.Right;
-            btnRefresh.Width = 42;
-            btnRefresh.Click += async (_, __) => await PrefetchRangeAsync(force: true);
-
-            btnSettings.Text = "⚙";
-            btnSettings.Dock = DockStyle.Right;
-            btnSettings.Width = 42;
-            btnSettings.Click += (_, __) => OpenSettings();
+            _toolTip.SetToolTip(btnCancel, "Devam eden sipariş çekme işlemini iptal eder.");
 
             btnRecord.Text = "Rec";
             btnRecord.Dock = DockStyle.Right;
-            btnRecord.Width = 50;
+            btnRecord.Width = 46;
             btnRecord.Click += (_, __) => ToggleRecording();
+            _toolTip.SetToolTip(btnRecord, "Kayıt modunu aç/kapat. Açıkken baktığın siparişler kaydedilir.");
 
             btnPlayback.Text = "▶";
             btnPlayback.Dock = DockStyle.Right;
-            btnPlayback.Width = 42;
+            btnPlayback.Width = 34;
             btnPlayback.Click += async (_, __) => await StartPlaybackAsync();
+            _toolTip.SetToolTip(btnPlayback, "Kaydedilen siparişleri kayıttan okuma modunda gösterir.");
+
+            btnNext.Text = "↓";
+            btnNext.Dock = DockStyle.Right;
+            btnNext.Width = 30;
+            btnNext.Click += async (_, __) => await NavigateRecordedAsync(+1);
+            _toolTip.SetToolTip(btnNext, "Kayıttan bir SONRAKİ kayda geç.");
+
+            btnPrev.Text = "↑";
+            btnPrev.Dock = DockStyle.Right;
+            btnPrev.Width = 30;
+            btnPrev.Click += async (_, __) => await NavigateRecordedAsync(-1);
+            _toolTip.SetToolTip(btnPrev, "Kayıttan bir ÖNCEKİ kayda dön.");
+
+            btnRefresh.Text = "↻";
+            btnRefresh.Dock = DockStyle.Right;
+            btnRefresh.Width = 34;
+            btnRefresh.Click += async (_, __) => await PrefetchRangeAsync(force: true);
+            _toolTip.SetToolTip(btnRefresh, "Tüm mağazalardan belirtilen tarih aralığındaki siparişleri çekip cache'i yeniler.");
+
+            btnSettings.Text = "⚙";
+            btnSettings.Dock = DockStyle.Right;
+            btnSettings.Width = 34;
+            btnSettings.Click += (_, __) => OpenSettings();
+            _toolTip.SetToolTip(btnSettings, "Mağaza API anahtarlarını ve tarih aralığını ayarla.");
+
+            // BUTON STİLİ (görsel)
+            StyleTopButton(btnCancel);
+            StyleTopButton(btnRecord);
+            StyleTopButton(btnPlayback);
+            StyleTopButton(btnNext);
+            StyleTopButton(btnPrev);
+            StyleTopButton(btnSettings);
+            StyleTopButton(btnRefresh, accent: true); // ana aksiyonu turuncu yaptık
 
             topPanel.Controls.Add(txtOrderItemNo);
             topPanel.Controls.Add(btnSettings);
             topPanel.Controls.Add(btnRefresh);
+            topPanel.Controls.Add(btnNext);
+            topPanel.Controls.Add(btnPrev);
             topPanel.Controls.Add(btnPlayback);
             topPanel.Controls.Add(btnRecord);
             topPanel.Controls.Add(btnCancel);
@@ -168,21 +270,20 @@ namespace Çiçeksepeti_Order_Peek
             lv.View = View.Details;
             lv.FullRowSelect = true;
             lv.GridLines = true;
-
-            // FOTO için çoklu seçim şart
             lv.MultiSelect = true;
-
-            lv.Font = new Font("Segoe UI", 8.5f);
+            lv.Font = new Font("Segoe UI", 9.5f);
             lv.SmallImageList = _thumbs;
+            lv.BackColor = Color.White;
+            lv.ForeColor = Color.Black;
+            lv.BorderStyle = BorderStyle.FixedSingle;
 
             if (!_thumbs.Images.ContainsKey(PlaceholderKey))
                 _thumbs.Images.Add(PlaceholderKey, MakePlaceholderThumb());
 
             lv.Columns.Clear();
             lv.Columns.Add("Alan", 150);
-            lv.Columns.Add("Müşteri", 170);
+            lv.Columns.Add("Kişiselleştirme", 180);
 
-            // Tek seçimde kopyala (çoklu seçimde kopyalama yapma)
             lv.ItemSelectionChanged += (_, __) =>
             {
                 if (lv.SelectedItems.Count != 1) return;
@@ -190,11 +291,10 @@ namespace Çiçeksepeti_Order_Peek
                 if (string.IsNullOrWhiteSpace(tag.Raw)) return;
 
                 Clipboard.SetText(tag.Raw);
-                SetStatus("Değer kopyalandı ✅");
+                SetStatus("Değer kopyalandı ✅", StatusKind.Ok);
                 LogOk("Seçili değer panoya kopyalandı.");
             };
 
-            // Foto sürükle-bırak
             lv.ItemDrag += (_, e) =>
             {
                 try
@@ -208,12 +308,9 @@ namespace Çiçeksepeti_Order_Peek
                         .ToList();
 
                     if (urls.Count == 0)
-                    {
-                        // Foto seçili değilse drag yapma (metin sürükleme istemedin)
                         return;
-                    }
 
-                    SetStatus($"Foto hazırlanıyor… ({urls.Count})");
+                    SetStatus($"Foto hazırlanıyor… ({urls.Count})", StatusKind.Info);
                     LogInfo($"Drag başlıyor (foto): {urls.Count} adet");
 
                     var files = new List<string>();
@@ -226,46 +323,76 @@ namespace Çiçeksepeti_Order_Peek
 
                     if (files.Count == 0)
                     {
-                        SetStatus("Foto indirilemedi.");
+                        SetStatus("Foto indirilemedi.", StatusKind.Warn);
                         return;
                     }
 
-                    // Photoshop/Explorer için FileDrop
                     var data = new DataObject();
                     data.SetData(DataFormats.FileDrop, files.ToArray());
-
-                    // Bonus: bazı uygulamalar URL text sever
                     data.SetData(DataFormats.UnicodeText, string.Join(Environment.NewLine, urls));
 
-                    SetStatus("Sürükleyebilirsin ✅");
+                    SetStatus("Sürükleyebilirsin ✅", StatusKind.Ok);
                     DoDragDrop(data, DragDropEffects.Copy);
                 }
                 catch (Exception ex)
                 {
-                    SetStatus("Drag hata ❌");
+                    SetStatus("Drag hata ❌", StatusKind.Error);
                     LogErr(ex.Message);
                 }
             };
+
+            // KAYIT PANELİ
+            _recordPanel.Dock = DockStyle.Bottom;
+            _recordPanel.Height = 60;
+            _recordPanel.Padding = new Padding(8, 2, 8, 2);
+            _recordPanel.Visible = false;
+            _recordPanel.BackColor = ColorAccentSoft;
+
+            _recordList.Dock = DockStyle.Fill;
+            _recordList.Font = new Font("Segoe UI", 8.0f);
+            _recordList.IntegralHeight = false;
+            _recordList.BackColor = Color.White;
+
+            _recordList.SelectedIndexChanged += async (_, __) =>
+            {
+                if (!_isPlayback) return;
+                var idx = _recordList.SelectedIndex;
+                if (idx < 0 || idx >= _recordedOrderItemNos.Count) return;
+
+                _recordIndex = idx;
+                await ShowRecordedAsync();
+                SetStatus($"Kayıttan okuma (liste): {_recordIndex + 1}/{_recordedOrderItemNos.Count}", StatusKind.Info);
+            };
+
+            _recordPanel.Controls.Add(_recordList);
 
             // Log
             txtLog.ReadOnly = true;
             txtLog.ScrollBars = RichTextBoxScrollBars.Vertical;
             txtLog.Dock = DockStyle.Bottom;
-            txtLog.Height = 115;
+            txtLog.Height = 70;
             txtLog.Font = new Font("Consolas", 7.75f);
-            txtLog.BackColor = SystemColors.Window;
-            txtLog.BorderStyle = BorderStyle.FixedSingle;
+            txtLog.BackColor = ColorLogBg;
+            txtLog.ForeColor = Color.FromArgb(60, 60, 60);
+            txtLog.BorderStyle = BorderStyle.None;
             txtLog.DetectUrls = false;
 
+            // STATUS BAR
             lblStatus.Text = "Hazır.";
             lblStatus.Dock = DockStyle.Bottom;
-            lblStatus.Padding = new Padding(8, 6, 8, 6);
+            lblStatus.AutoSize = false;                         // Boyutu biz kontrol edeceğiz
+            lblStatus.Height = 26;                              // İstediğin kadar yükselt
+            lblStatus.Font = new Font("Segoe UI", 8.0f);        // Yazı boyutunu da küçült
+            lblStatus.Padding = new Padding(8, 4, 8, 4);
+            lblStatus.TextAlign = ContentAlignment.MiddleLeft;  // Dikey ortalansın
 
             Controls.Clear();
             Controls.Add(lv);
-            Controls.Add(lblStatus);
+            Controls.Add(_recordPanel);
             Controls.Add(txtLog);
+            Controls.Add(lblStatus);
             Controls.Add(topPanel);
+
         }
 
         private void ApplyAlwaysOnTopBottomRight()
@@ -303,10 +430,36 @@ namespace Çiçeksepeti_Order_Peek
             }
         }
 
-        private void SetStatus(string msg)
+        private void SetStatus(string msg, StatusKind kind = StatusKind.Info)
         {
             lblStatus.Text = msg;
-            LogInfo(msg);
+
+            switch (kind)
+            {
+                case StatusKind.Ok:
+                    lblStatus.BackColor = Color.FromArgb(220, 244, 234);
+                    lblStatus.ForeColor = Color.DarkGreen;
+                    LogOk(msg);
+                    break;
+
+                case StatusKind.Warn:
+                    lblStatus.BackColor = Color.FromArgb(255, 245, 225);
+                    lblStatus.ForeColor = Color.DarkOrange;
+                    LogWarn(msg);
+                    break;
+
+                case StatusKind.Error:
+                    lblStatus.BackColor = Color.FromArgb(255, 230, 230);
+                    lblStatus.ForeColor = Color.DarkRed;
+                    LogErr(msg);
+                    break;
+
+                default:
+                    lblStatus.BackColor = Color.FromArgb(235, 241, 252);
+                    lblStatus.ForeColor = Color.FromArgb(40, 60, 90);
+                    LogInfo(msg);
+                    break;
+            }
         }
 
         // ========= RENKLİ LOG =========
@@ -351,6 +504,18 @@ namespace Çiçeksepeti_Order_Peek
                 LogErr("Ne yapmalı: DNS/İnternet sorunu. VPN/Proxy varsa kapat, bağlantıyı kontrol et.");
         }
 
+        // ---- Playback butonlarının görünürlüğünü kontrol eden helper
+        private void UpdatePlaybackButtonsUI()
+        {
+            bool show = _isPlayback && _recordedOrderItemNos.Count > 0;
+
+            btnPrev.Visible = show;
+            btnPrev.Enabled = show;
+
+            btnNext.Visible = show;
+            btnNext.Enabled = show;
+        }
+
         // ================== KAYIT MODU ==================
 
         private void ToggleRecording()
@@ -360,32 +525,68 @@ namespace Çiçeksepeti_Order_Peek
                 _isRecording = true;
                 _isPlayback = false;
                 _recordedOrderItemNos.Clear();
+                _recordList.Items.Clear();
                 _recordIndex = -1;
 
+                _recordPanel.Visible = false;
+
                 btnRecord.Text = "Dur";
-                SetStatus("Kayıt modu: AÇIK. Sipariş numaralarını sırayla gir.");
+                Text = _baseTitle + " — Kayıt";
+                SetStatus("Kayıt modu: AÇIK. Sipariş numaralarını sırayla gir.", StatusKind.Info);
                 LogInfo("Kayıt modu AÇIK.");
+
+                // REC görünümü
+                btnRecord.BackColor = Color.FromArgb(220, 53, 69); // kırmızı
+                btnRecord.ForeColor = Color.White;
+
+                UpdatePlaybackButtonsUI();
             }
             else
             {
                 _isRecording = false;
                 btnRecord.Text = "Rec";
-                SetStatus($"Kayıt modu: KAPALI. Kaydedilen sipariş: {_recordedOrderItemNos.Count}");
+                Text = _baseTitle;
+                SetStatus($"Kayıt modu: KAPALI. Kaydedilen sipariş: {_recordedOrderItemNos.Count}", StatusKind.Info);
                 LogInfo("Kayıt modu KAPALI.");
+
+                // Eski stile dön
+                btnRecord.BackColor = ColorTopBar;
+                btnRecord.ForeColor = Color.White;
+
+                UpdatePlaybackButtonsUI();
             }
         }
 
-        private void RegisterRecording(int orderItemId)
+        private void RegisterRecording(CachedOrderItem item)
         {
             if (!_isRecording) return;
 
-            if (!_recordedOrderItemNos.Contains(orderItemId))
-            {
-                _recordedOrderItemNos.Add(orderItemId);
-                _recordIndex = _recordedOrderItemNos.Count - 1;
-                LogInfo($"Kayıt eklendi: {orderItemId} (toplam: {_recordedOrderItemNos.Count})");
-            }
+            var orderItemId = item.OrderItemId;
+
+            if (_recordedOrderItemNos.Contains(orderItemId))
+                return;
+
+            _recordedOrderItemNos.Add(orderItemId);
+            _recordIndex = _recordedOrderItemNos.Count - 1;
+
+            _recordPanel.Visible = true;
+
+            // 1. kişiselleştirme satırını al
+            string snippet = "";
+            var firstPers = item.Personalizations.FirstOrDefault();
+            if (firstPers != null)
+                snippet = Shorten(firstPers.RawText ?? "", 60);
+
+            string display = string.IsNullOrWhiteSpace(snippet)
+                ? orderItemId.ToString()
+                : $"{orderItemId} - {snippet}";
+
+            _recordList.Items.Add(display);
+            _recordList.SelectedIndex = _recordIndex;
+
+            LogInfo($"Kayıt eklendi: {orderItemId} (toplam: {_recordedOrderItemNos.Count})");
         }
+
 
         private async Task StartPlaybackAsync()
         {
@@ -400,12 +601,19 @@ namespace Çiçeksepeti_Order_Peek
             }
 
             _isPlayback = true;
+            _recordPanel.Visible = true;
+            Text = _baseTitle + " — Kayıttan Okuma";
 
             if (_recordIndex < 0 || _recordIndex >= _recordedOrderItemNos.Count)
                 _recordIndex = 0;
 
+            if (_recordIndex < _recordList.Items.Count)
+                _recordList.SelectedIndex = _recordIndex;
+
+            UpdatePlaybackButtonsUI();
+
             await ShowRecordedAsync();
-            SetStatus($"Kayıttan okuma: {_recordIndex + 1}/{_recordedOrderItemNos.Count}. Yukarı/Aşağı ok ile gez.");
+            SetStatus($"Kayıttan okuma: {_recordIndex + 1}/{_recordedOrderItemNos.Count}. Yukarı/Aşağı ok veya ↑/↓ butonları ile gez.", StatusKind.Info);
         }
 
         private async Task ShowRecordedAsync()
@@ -416,6 +624,9 @@ namespace Çiçeksepeti_Order_Peek
             var id = _recordedOrderItemNos[_recordIndex];
             txtOrderItemNo.Text = id.ToString();
             await LookupAndRenderByIdFromCacheAsync(id);
+
+            if (_recordIndex < _recordList.Items.Count && _recordList.SelectedIndex != _recordIndex)
+                _recordList.SelectedIndex = _recordIndex;
         }
 
         private async Task NavigateRecordedAsync(int delta)
@@ -429,7 +640,7 @@ namespace Çiçeksepeti_Order_Peek
 
             _recordIndex = newIndex;
             await ShowRecordedAsync();
-            SetStatus($"Kayıttan okuma: {_recordIndex + 1}/{_recordedOrderItemNos.Count}");
+            SetStatus($"Kayıttan okuma: {_recordIndex + 1}/{_recordedOrderItemNos.Count}", StatusKind.Info);
         }
 
         // ============== CORE ==============
@@ -440,7 +651,7 @@ namespace Çiçeksepeti_Order_Peek
 
             if (!int.TryParse(txtOrderItemNo.Text.Trim(), out var orderItemId))
             {
-                SetStatus("Alt sipariş no sayı olmalı.");
+                SetStatus("Alt sipariş no sayı olmalı.", StatusKind.Warn);
                 return;
             }
 
@@ -451,15 +662,15 @@ namespace Çiçeksepeti_Order_Peek
         {
             if (_cacheByOrderItemId.TryGetValue(orderItemId, out var cached))
             {
-                RegisterRecording(orderItemId);
+                RegisterRecording(cached);
                 RenderPersonalizations(cached);
                 CopyOnlyPersonalizationValues(cached);
-                SetStatus("Cache’den bulundu ✅");
+                SetStatus("Cache’den bulundu ✅", StatusKind.Ok);
                 LogOk($"Cache hit: {orderItemId}");
             }
             else
             {
-                SetStatus("Cache’de bulunamadı.");
+                SetStatus("Cache’de bulunamadı.", StatusKind.Warn);
                 LogWarn($"Cache miss (tekil API sorgusu YOK): {orderItemId}");
 
                 MessageBox.Show(this,
@@ -470,14 +681,18 @@ namespace Çiçeksepeti_Order_Peek
                     MessageBoxIcon.Information);
             }
 
+            txtOrderItemNo.Focus();
+            txtOrderItemNo.SelectAll();
+
             await Task.CompletedTask;
         }
 
         private async Task PrefetchRangeAsync(bool force = false)
         {
-            if (string.IsNullOrWhiteSpace(_settings.ApiKey))
+            var stores = GetActiveStores();
+            if (stores.Count == 0)
             {
-                SetStatus("API Key yok. ⚙ ile gir.");
+                SetStatus("Hiç mağaza için API Key yok. ⚙ ile ekle.", StatusKind.Warn);
                 return;
             }
 
@@ -503,50 +718,61 @@ namespace Çiçeksepeti_Order_Peek
                 var start = now.AddDays(-pastDays);
                 var end = now.AddDays(+futureDays);
 
-                SetStatus($"Siparişler çekiliyor… ({pastDays} gün geri, {futureDays} gün ileri)");
-                LogInfo($"Prefetch range: {start:O} -> {end:O}");
+                _cacheByOrderItemId.Clear();
 
-                int page = 0;
-                int before = _cacheByOrderItemId.Count;
+                SetStatus($"Siparişler çekiliyor… ({pastDays} gün geri, {futureDays} gün ileri, mağaza: {stores.Count} adet)", StatusKind.Info);
+                LogInfo($"Prefetch range: {start:O} -> {end:O}, stores={stores.Count}");
 
-                while (true)
+                int before = 0;
+
+                foreach (var store in stores)
                 {
-                    _cts.Token.ThrowIfCancellationRequested();
+                    if (string.IsNullOrWhiteSpace(store.ApiKey))
+                        continue;
 
-                    var body = new
+                    LogInfo($"Mağaza: {store.Name} (sandbox={store.UseSandbox})");
+
+                    int page = 0;
+
+                    while (true)
                     {
-                        startDate = start.ToString("O"),
-                        endDate = end.ToString("O"),
-                        pageSize = 100,
-                        page = page
-                    };
+                        _cts.Token.ThrowIfCancellationRequested();
 
-                    var resp = await ApiGetOrdersAsync(body, _cts.Token);
-                    var list = resp?.SupplierOrderListWithBranch ?? new List<OrderItem>();
-                    if (list.Count == 0) break;
+                        var body = new
+                        {
+                            startDate = start.ToString("O"),
+                            endDate = end.ToString("O"),
+                            pageSize = 100,
+                            page = page
+                        };
 
-                    foreach (var oi in list)
-                    {
-                        var c = ToCached(oi);
-                        _cacheByOrderItemId[c.OrderItemId] = c;
+                        var resp = await ApiGetOrdersAsync(store, body, _cts.Token);
+                        var list = resp?.SupplierOrderListWithBranch ?? new List<OrderItem>();
+                        if (list.Count == 0) break;
+
+                        foreach (var oi in list)
+                        {
+                            var c = ToCached(oi);
+                            _cacheByOrderItemId[c.OrderItemId] = c;
+                        }
+
+                        LogInfo($"[Store={store.Name}] Page {page} -> {list.Count} kayıt (cache: {_cacheByOrderItemId.Count})");
+                        page++;
                     }
-
-                    LogInfo($"Page {page} -> {list.Count} kayıt (cache: {_cacheByOrderItemId.Count})");
-                    page++;
                 }
 
                 var added = _cacheByOrderItemId.Count - before;
-                SetStatus($"Cache hazır ✅ (+{added}, toplam {_cacheByOrderItemId.Count})");
+                SetStatus($"Cache hazır ✅ (toplam {_cacheByOrderItemId.Count})", StatusKind.Ok);
                 LogOk("Prefetch bitti.");
             }
             catch (OperationCanceledException)
             {
-                SetStatus("Prefetch iptal.");
+                SetStatus("Prefetch iptal.", StatusKind.Warn);
                 LogWarn("Prefetch iptal edildi.");
             }
             catch (Exception ex)
             {
-                SetStatus("Prefetch hata ❌");
+                SetStatus("Prefetch hata ❌", StatusKind.Error);
                 LogErr(ex.Message);
                 LogWhatToDo(ex);
                 LogErr(ex.ToString());
@@ -587,17 +813,26 @@ namespace Çiçeksepeti_Order_Peek
                     bool isImg = LooksLikeImageUrl(field, raw);
 
                     var row = new ListViewItem(field);
-                    row.SubItems.Add(raw); // ekranda RAW
+                    row.SubItems.Add(raw);
                     row.Tag = new RowTag(field, raw, isImg, null);
+
+                    // Tek bakışta okunurluk için highlight
+                    if (LooksLikeNameField(field))
+                    {
+                        row.BackColor = Color.FromArgb(230, 255, 230); // hafif yeşil
+                    }
+                    else if (LooksLikeDateField(field))
+                    {
+                        row.BackColor = Color.FromArgb(230, 240, 255); // hafif mavi
+                    }
 
                     if (isImg)
                     {
                         row.ImageKey = PlaceholderKey;
 
-                        // thumbnail yükle (asenkron)
                         var url = raw.Trim();
                         var key = ThumbKey(url);
-                        row.Name = key; // item identity gibi kullanacağız
+                        row.Name = key;
 
                         _ = LoadThumbAsync(url, key, row);
                     }
@@ -618,8 +853,47 @@ namespace Çiçeksepeti_Order_Peek
                 .Where(v => !string.IsNullOrWhiteSpace(v))
                 .ToList();
 
-            Clipboard.SetText(values.Count == 0 ? "" : string.Join(Environment.NewLine, values));
-            LogInfo(values.Count == 0 ? "Kopya: boş" : $"Kopya: {values.Count} satır");
+            if (values.Count == 0)
+            {
+                // KİŞİSELLEŞTİRME YOK DURUMU
+                SetStatus("Bu ürün için kişiselleştirme bulunmuyor.", StatusKind.Warn);
+                LogInfo("Kopya: kişiselleştirme yok (panoya bir şey yazılmadı).");
+                return;
+            }
+
+            // En az 1 satır varsa clipboard’a yaz
+            var joined = string.Join(Environment.NewLine, values);
+            Clipboard.SetText(joined);
+            LogInfo($"Kopya: {values.Count} satır");
+        }
+
+
+        private static bool LooksLikeNameField(string field)
+        {
+            if (string.IsNullOrWhiteSpace(field)) return false;
+            var f = field.Trim().ToLowerInvariant();
+
+            return f.Contains("isim")
+                || f.Contains("ad soyad")
+                || f.Contains("adı soyadı")
+                || f.Contains("ad-soyad")
+                || f.Contains("isim soyisim")
+                || f.Contains("name")
+                || f.Contains("full name")
+                || f.Contains("fullname");
+        }
+
+        private static bool LooksLikeDateField(string field)
+        {
+            if (string.IsNullOrWhiteSpace(field)) return false;
+            var f = field.Trim().ToLowerInvariant();
+
+            return f.Contains("tarih")
+                || f.Contains("date")
+                || f.Contains("zaman")
+                || f.Contains("time")
+                || f.Contains("teslimat günü")
+                || f.Contains("gönderim tarihi");
         }
 
         private static bool LooksLikeImageUrl(string field, string raw)
@@ -815,11 +1089,41 @@ namespace Çiçeksepeti_Order_Peek
             return bmp;
         }
 
+        // ============== MAĞAZA YARDIMCI ==============
+
+        private List<StoreConfig> GetActiveStores()
+        {
+            var list = new List<StoreConfig>();
+
+            if (_settings.Stores != null && _settings.Stores.Count > 0)
+            {
+                list.AddRange(
+                    _settings.Stores
+                        .Where(s => !string.IsNullOrWhiteSpace(s.ApiKey))
+                );
+            }
+            else if (!string.IsNullOrWhiteSpace(_settings.ApiKey))
+            {
+                list.Add(new StoreConfig
+                {
+                    Name = "Varsayılan",
+                    ApiKey = _settings.ApiKey,
+                    UseSandbox = _settings.UseSandbox
+                });
+            }
+
+            return list;
+        }
+
         // ============== API LOW-LEVEL (THROTTLE + RETRY) ==============
 
-        private async Task<GetOrdersResponse> ApiGetOrdersAsync(object body, CancellationToken ct)
+        private async Task<GetOrdersResponse> ApiGetOrdersAsync(StoreConfig store, object body, CancellationToken ct)
         {
-            var url = $"{_settings.BaseUrl}/api/v1/Order/GetOrders";
+            var baseUrl = store.UseSandbox
+                ? "https://sandbox-apis.ciceksepeti.com"
+                : "https://apis.ciceksepeti.com";
+
+            var url = $"{baseUrl}/api/v1/Order/GetOrders";
             var jsonBody = JsonSerializer.Serialize(body);
 
             for (int attempt = 0; attempt < 3; attempt++)
@@ -834,7 +1138,7 @@ namespace Çiçeksepeti_Order_Peek
                     _lastGetOrdersUtc = DateTime.UtcNow;
 
                     using var req = new HttpRequestMessage(HttpMethod.Post, url);
-                    req.Headers.Add("x-api-key", _settings.ApiKey);
+                    req.Headers.Add("x-api-key", store.ApiKey);
                     req.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
                     req.Content = new StringContent(jsonBody, Encoding.UTF8, "application/json");
 
@@ -850,10 +1154,14 @@ namespace Çiçeksepeti_Order_Peek
                     if (json.Contains("Limit aşımı", StringComparison.OrdinalIgnoreCase))
                     {
                         var sec = ParseRemainingSeconds(json);
-                        LogWarn($"Rate limit: {sec}s bekleyip tekrar deneyeceğim…");
+                        SetStatus($"[Store={store.Name}] Çok hızlı istek atılıyor, yaklaşık {sec} sn bekleniyor…", StatusKind.Warn);
+                        LogWarn($"[Store={store.Name}] Rate limit: {sec}s bekleyip tekrar deneyeceğim…");
                         await Task.Delay(Math.Max(1000, sec * 1000 + 250), ct);
                         continue;
                     }
+
+                    LogErr($"[Store={store.Name}] API {(int)res.StatusCode} {res.ReasonPhrase}");
+                    LogErr(json);
 
                     throw new Exception($"API {(int)res.StatusCode} {res.ReasonPhrase}\nRequest: {jsonBody}\nResponse: {json}");
                 }
@@ -898,6 +1206,15 @@ namespace Çiçeksepeti_Order_Peek
             );
         }
 
+        private static string Shorten(string s, int max)
+        {
+            if (string.IsNullOrWhiteSpace(s)) return "";
+            s = s.Trim();
+            if (s.Length <= max) return s;
+            return s.Substring(0, max).TrimEnd() + "…";
+        }
+
+
         // ============== SETTINGS ==============
 
         private void OpenSettings()
@@ -920,12 +1237,12 @@ namespace Çiçeksepeti_Order_Peek
                 if (result == DialogResult.OK)
                 {
                     SettingsStore.Save(_settings);
-                    SetStatus($"Ayarlar kaydedildi. Sandbox={_settings.UseSandbox}  Range=-{_settings.PrefetchPastDays}/+{_settings.PrefetchFutureDays}");
+                    SetStatus($"Ayarlar kaydedildi. Range=-{_settings.PrefetchPastDays}/+{_settings.PrefetchFutureDays}", StatusKind.Ok);
                     LogOk("Ayarlar kaydedildi.");
                 }
                 else
                 {
-                    SetStatus("Ayarlar kapatıldı.");
+                    SetStatus("Ayarlar kapatıldı.", StatusKind.Info);
                     LogInfo("Ayarlar kapatıldı.");
                 }
             }
